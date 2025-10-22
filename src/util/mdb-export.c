@@ -53,6 +53,12 @@ main(int argc, char **argv)
 	char *null_text = NULL;
 	int export_flags = 0;
 	int bin_mode = 0;
+    int col_to_export = 65535;
+    char *columns_to_export = NULL;
+    const char *cte_delims = ", ";
+    char *cte_save_ptr;
+    int cte_count = 0;
+    char *token_state = NULL;
 	char *value;
 	size_t length;
 	int ret;
@@ -73,6 +79,8 @@ main(int argc, char **argv)
 		{"batch-size", 'S', 0, G_OPTION_ARG_INT, &batch_size, "Size of insert batches on supported platforms.", "int"},
 		{"date-format", 'D', 0, G_OPTION_ARG_STRING, &shortdate_fmt, "Set the date format (see strftime(3) for details)", "format"},
 		{"datetime-format", 'T', 0, G_OPTION_ARG_STRING, &date_fmt, "Set the date/time format (see strftime(3) for details)", "format"},
+        {"export-col", 'c', 0, G_OPTION_ARG_INT, &col_to_export, "Choose a single column to export (zero-based)", "int" },
+        {"export-multi-col", 'C', 0, G_OPTION_ARG_STRING, &columns_to_export, "Choose multiple columns to export (string, columns are zero-based)", "char" },
 		{"null", '0', 0, G_OPTION_ARG_STRING, &null_text, "Use <char> to represent a NULL value", "char"},
 		{"bin", 'b', 0, G_OPTION_ARG_STRING, &str_bin_mode, "Binary export mode", "strip|raw|octal|hex"},
 		{"boolean-words", 'B', 0, G_OPTION_ARG_NONE, &boolean_words, "Use TRUE/FALSE in Boolean fields (default is 0/1)", NULL},
@@ -156,10 +164,11 @@ main(int argc, char **argv)
 	} else {
 		bin_mode = MDB_BINEXPORT_RAW;
     }
-
+    
 	if (escape_cr_lf) {
 		export_flags |= MDB_EXPORT_ESCAPE_CONTROL_CHARS;
 	}
+    
 
 	/* Open file */
 	if (!(mdb = mdb_open(argv[1], MDB_NOFLAGS))) {
@@ -198,22 +207,68 @@ main(int argc, char **argv)
 
 	bound_values = g_malloc(table->num_cols * sizeof(char *));
 	bound_lens = g_malloc(table->num_cols * sizeof(int));
-	for (i = 0; i < table->num_cols; i++) {
-		/* bind columns */
-		bound_values[i] = g_malloc0(EXPORT_BIND_SIZE);
-		ret = mdb_bind_column(table, i + 1, bound_values[i], &bound_lens[i]);
-		if (ret == -1) {
-			fprintf(stderr, "Failed to bind column %d\n", i + 1);
-			exit(1);
-		}
-	}
+	    
+    int cte_array[table->num_cols];
+    
+    if (columns_to_export) {
+        cte_count = 0;
+        char *cte_token = strtok_r(columns_to_export, cte_delims, &cte_save_ptr);
+        while (cte_token != NULL) {
+            if (cte_count < table->num_cols)
+                cte_array[cte_count++] = atoi(cte_token);
+            cte_token = strtok_r(NULL, cte_delims, &cte_save_ptr);
+        }
+        g_free(cte_token);
+    }
+                         
+    if (col_to_export < 65535) {  //Functionality to export a single column rather than the whole table
+        /* bind column */
+        bound_values[col_to_export] = g_malloc0(EXPORT_BIND_SIZE);
+        ret = mdb_bind_column(table, col_to_export + 1, bound_values[col_to_export], &bound_lens[col_to_export]);
+        if (ret == -1) {
+            fprintf(stderr, "Failed to bind column %d\n", col_to_export + 1);
+            exit(1);
+        }
+    } else if (columns_to_export) {  //Functionality to export a delimited selection of columns
+        for (i = 0; i < cte_count; i++) {
+            /* bind columns */
+            bound_values[cte_array[i]] = g_malloc0(EXPORT_BIND_SIZE);
+            ret = mdb_bind_column(table, cte_array[i] + 1, bound_values[cte_array[i]], &bound_lens[cte_array[i]]);
+            if (ret == -1) {
+                fprintf(stderr, "Failed to bind column %d\n", cte_array[i] + 1);
+                exit(1);
+            }
+        }
+    } else {
+        for (i = 0; i < table->num_cols; i++) {
+            /* bind columns */
+            bound_values[i] = g_malloc0(EXPORT_BIND_SIZE);
+            ret = mdb_bind_column(table, i + 1, bound_values[i], &bound_lens[i]);
+            if (ret == -1) {
+                fprintf(stderr, "Failed to bind column %d\n", i + 1);
+                exit(1);
+            }
+        }
+    }
 	if (header_row) {
-		for (i = 0; i < table->num_cols; i++) {
-			col = g_ptr_array_index(table->columns, i);
-			if (i)
-				fputs(delimiter, outfile);
-			fputs(col->name, outfile);
-		}
+        if (col_to_export < 65535) {  //Functionality to export a single column rather than the whole table
+            col = g_ptr_array_index(table->columns, col_to_export);
+            fputs(col->name, outfile);
+        } else if (columns_to_export) {  //Functionality to export a delimited selection of columns
+            for (i = 0; i < cte_count; i++) {
+                col = g_ptr_array_index(table->columns, cte_array[i]);
+                if (i > 0)
+                    fputs(delimiter, outfile);
+                fputs(col->name, outfile);
+            }
+        } else {
+            for (i = 0; i < table->num_cols; i++) {
+                col = g_ptr_array_index(table->columns, i);
+                if (i > 0)
+                    fputs(delimiter, outfile);
+                fputs(col->name, outfile);
+            }
+        }
 		fputs(row_delimiter, outfile);
 	}
 
@@ -229,45 +284,116 @@ main(int argc, char **argv)
 				quoted_name = mdb_normalise_and_replace(mdb, &quoted_name);
 				fprintf(outfile, "INSERT INTO %s (", quoted_name);
 				free(quoted_name);
-				for (i = 0; i < table->num_cols; i++) {
-					if (i > 0) fputs(", ", outfile);
-					col = g_ptr_array_index(table->columns, i);
-					quoted_name = mdb->default_backend->quote_schema_name(NULL, col->name);
-					quoted_name = mdb_normalise_and_replace(mdb, &quoted_name);
-					fputs(quoted_name, outfile);
-					free(quoted_name);
-				}
+				
+                if (col_to_export < 65535) {
+                    col = g_ptr_array_index(table->columns, col_to_export);
+                    quoted_name = mdb->default_backend->quote_schema_name(NULL, col->name);
+                    quoted_name = mdb_normalise_and_replace(mdb, &quoted_name);
+                    fputs(quoted_name, outfile);
+                    free(quoted_name);
+                } else if (columns_to_export) {
+                    for (i = 0; i < cte_count; i++) {
+                        if (i > 0) fputs(", ", outfile);
+                        col = g_ptr_array_index(table->columns, cte_array[i]);
+                        quoted_name = mdb->default_backend->quote_schema_name(NULL, col->name);
+                        quoted_name = mdb_normalise_and_replace(mdb, &quoted_name);
+                        fputs(quoted_name, outfile);
+                        free(quoted_name);
+                    }
+                } else {
+                    for (i = 0; i < table->num_cols; i++) {
+                        if (i > 0) fputs(", ", outfile);
+                        col = g_ptr_array_index(table->columns, i);
+                        quoted_name = mdb->default_backend->quote_schema_name(NULL, col->name);
+                        quoted_name = mdb_normalise_and_replace(mdb, &quoted_name);
+                        fputs(quoted_name, outfile);
+                        free(quoted_name);
+                    }
+                }
 				fputs(") VALUES ", outfile);
 			} else {
 				fputs(", ", outfile);
 			}
 			fputs("(", outfile);
-			for (i = 0; i < table->num_cols; i++) {
-				if (i > 0)
-					fputs(delimiter, outfile);
-				col = g_ptr_array_index(table->columns, i);
-				if (!bound_lens[i]) {
-					/* Don't quote NULLs */
-					if (insert_dialect)
-						fputs("NULL", outfile);
-					else
-						fputs(null_text, outfile);
-				} else {
-					if (col->col_type == MDB_OLE) {
-						value = mdb_ole_read_full(mdb, col, &length);
-					} else {
-						value = bound_values[i];
-						length = bound_lens[i];
-					}
-					format_value(outfile, value, length,
-						     quote_text, col->col_type,
-						     escape_char, quote_char,
-						     bin_mode, export_flags,
-						     mdb->backend_name);
-					if (col->col_type == MDB_OLE)
-						free(value);
-				}
-			}
+			
+            if (col_to_export < 65535) {
+                col = g_ptr_array_index(table->columns, col_to_export);
+                if (!bound_lens[col_to_export]) {
+                    /* Don't quote NULLs */
+                    if (insert_dialect)
+                        fputs("NULL", outfile);
+                    else
+                        fputs(null_text, outfile);
+                } else {
+                    if (col->col_type == MDB_OLE) {
+                        value = mdb_ole_read_full(mdb, col, &length);
+                    } else {
+                        value = bound_values[col_to_export];
+                        length = bound_lens[col_to_export];
+                    }
+                    format_value(outfile, value, length,
+                             quote_text, col->col_type,
+                             escape_char, quote_char,
+                             bin_mode, export_flags,
+                             mdb->backend_name);
+                    if (col->col_type == MDB_OLE)
+                        free(value);
+                }
+            } else if (columns_to_export) {
+                for (i = 0; i < cte_count; i++) {
+                    if (i > 0)
+                        fputs(delimiter, outfile);
+                    col = g_ptr_array_index(table->columns, cte_array[i]);
+                    if (!bound_lens[cte_array[i]]) {
+                        /* Don't quote NULLs */
+                        if (insert_dialect)
+                            fputs("NULL", outfile);
+                        else
+                            fputs(null_text, outfile);
+                    } else {
+                        if (col->col_type == MDB_OLE) {
+                            value = mdb_ole_read_full(mdb, col, &length);
+                        } else {
+                            value = bound_values[cte_array[i]];
+                            length = bound_lens[cte_array[i]];
+                        }
+                        format_value(outfile, value, length,
+                                     quote_text, col->col_type,
+                                     escape_char, quote_char,
+                                     bin_mode, export_flags,
+                                     mdb->backend_name);
+                        if (col->col_type == MDB_OLE)
+                            free(value);
+                    }
+                }
+            } else {
+                for (i = 0; i < table->num_cols; i++) {
+                    if (i > 0)
+                        fputs(delimiter, outfile);
+                    col = g_ptr_array_index(table->columns, i);
+                    if (!bound_lens[i]) {
+                        /* Don't quote NULLs */
+                        if (insert_dialect)
+                            fputs("NULL", outfile);
+                        else
+                            fputs(null_text, outfile);
+                    } else {
+                        if (col->col_type == MDB_OLE) {
+                            value = mdb_ole_read_full(mdb, col, &length);
+                        } else {
+                            value = bound_values[i];
+                            length = bound_lens[i];
+                        }
+                        format_value(outfile, value, length,
+                                     quote_text, col->col_type,
+                                     escape_char, quote_char,
+                                     bin_mode, export_flags,
+                                     mdb->backend_name);
+                        if (col->col_type == MDB_OLE)
+                            free(value);
+                    }
+                }
+            }
 			fputs(")", outfile);
 			if (counter % batch_size == batch_size - 1) {
 				fputs(";", outfile);
@@ -276,7 +402,7 @@ main(int argc, char **argv)
 			counter++;
 		}
 		if (counter % batch_size != 0) {
-			//if our last row did not land on closing tag, close the stement here
+			//if our last row did not land on closing tag, close the statement here
 			fputs(";", outfile);
 			fputs(row_delimiter, outfile);
 		}
@@ -289,52 +415,131 @@ main(int argc, char **argv)
 				quoted_name = mdb_normalise_and_replace(mdb, &quoted_name);
 				fprintf(outfile, "INSERT INTO %s (", quoted_name);
 				free(quoted_name);
-				for (i = 0; i < table->num_cols; i++) {
-					if (i > 0) fputs(", ", outfile);
-					col = g_ptr_array_index(table->columns, i);
-					quoted_name = mdb->default_backend->quote_schema_name(NULL, col->name);
-					quoted_name = mdb_normalise_and_replace(mdb, &quoted_name);
-					fputs(quoted_name, outfile);
-					free(quoted_name);
-				}
+				
+                if (col_to_export < 65535) {
+                    col = g_ptr_array_index(table->columns, col_to_export);
+                    quoted_name = mdb->default_backend->quote_schema_name(NULL, col->name);
+                    quoted_name = mdb_normalise_and_replace(mdb, &quoted_name);
+                    fputs(quoted_name, outfile);
+                    free(quoted_name);
+                } else if (columns_to_export) {
+                    for (i = 0; i < cte_count; i++) {
+                        if (i > 0) fputs(", ", outfile);
+                        col = g_ptr_array_index(table->columns, cte_array[i]);
+                        quoted_name = mdb->default_backend->quote_schema_name(NULL, col->name);
+                        quoted_name = mdb_normalise_and_replace(mdb, &quoted_name);
+                        fputs(quoted_name, outfile);
+                        free(quoted_name);
+                    }
+                } else {
+                    for (i = 0; i < table->num_cols; i++) {
+                        if (i > 0) fputs(", ", outfile);
+                        col = g_ptr_array_index(table->columns, i);
+                        quoted_name = mdb->default_backend->quote_schema_name(NULL, col->name);
+                        quoted_name = mdb_normalise_and_replace(mdb, &quoted_name);
+                        fputs(quoted_name, outfile);
+                        free(quoted_name);
+                    }
+                }
 				fputs(") VALUES (", outfile);
 			}
 
-			for (i = 0; i < table->num_cols; i++) {
-				if (i > 0)
-					fputs(delimiter, outfile);
-				col = g_ptr_array_index(table->columns, i);
-				if (!bound_lens[i]) {
-					/* Don't quote NULLs */
-					if (insert_dialect)
-						fputs("NULL", outfile);
-					else
-						fputs(null_text, outfile);
-				} else {
-					if (col->col_type == MDB_OLE) {
-						value = mdb_ole_read_full(mdb, col, &length);
-					} else {
-						value = bound_values[i];
-						length = bound_lens[i];
-					}
-					format_value(outfile, value, length,
-						     quote_text, col->col_type,
-						     escape_char, quote_char,
-						     bin_mode, export_flags,
-						     mdb->backend_name);
-					if (col->col_type == MDB_OLE)
-						free(value);
-				}
-			}
+            if (col_to_export < 65535) {
+                col = g_ptr_array_index(table->columns, col_to_export);
+                if (!bound_lens[col_to_export]) {
+                    /* Don't quote NULLs */
+                    if (insert_dialect)
+                        fputs("NULL", outfile);
+                    else
+                        fputs(null_text, outfile);
+                } else {
+                    if (col->col_type == MDB_OLE) {
+                        value = mdb_ole_read_full(mdb, col, &length);
+                    } else {
+                        value = bound_values[col_to_export];
+                        length = bound_lens[col_to_export];
+                    }
+                    format_value(outfile, value, length,
+                             quote_text, col->col_type,
+                             escape_char, quote_char,
+                             bin_mode, export_flags,
+                             mdb->backend_name);
+                    if (col->col_type == MDB_OLE)
+                        free(value);
+                }
+            } else if (columns_to_export) {
+                for (i = 0; i < cte_count; i++) {
+                    if (i > 0)
+                        fputs(delimiter, outfile);
+                    col = g_ptr_array_index(table->columns, cte_array[i]);
+                    if (!bound_lens[cte_array[i]]) {
+                        /* Don't quote NULLs */
+                        if (insert_dialect)
+                            fputs("NULL", outfile);
+                        else
+                            fputs(null_text, outfile);
+                    } else {
+                        if (col->col_type == MDB_OLE) {
+                            value = mdb_ole_read_full(mdb, col, &length);
+                        } else {
+                            value = bound_values[cte_array[i]];
+                            length = bound_lens[cte_array[i]];
+                        }
+                        format_value(outfile, value, length,
+                                     quote_text, col->col_type,
+                                     escape_char, quote_char,
+                                     bin_mode, export_flags,
+                                     mdb->backend_name);
+                        if (col->col_type == MDB_OLE) {
+                            free(value);
+                        }
+                    }
+                }
+            } else {
+                for (i = 0; i < table->num_cols; i++) {
+                    if (i > 0)
+                        fputs(delimiter, outfile);
+                    col = g_ptr_array_index(table->columns, i);
+                    if (!bound_lens[i]) {
+                        /* Don't quote NULLs */
+                        if (insert_dialect)
+                            fputs("NULL", outfile);
+                        else
+                            fputs(null_text, outfile);
+                    } else {
+                        if (col->col_type == MDB_OLE) {
+                            value = mdb_ole_read_full(mdb, col, &length);
+                        } else {
+                            value = bound_values[i];
+                            length = bound_lens[i];
+                        }
+                        format_value(outfile, value, length,
+                                     quote_text, col->col_type,
+                                     escape_char, quote_char,
+                                     bin_mode, export_flags,
+                                     mdb->backend_name);
+                        if (col->col_type == MDB_OLE)
+                            free(value);
+                    }
+                }
+            }
 			if (insert_dialect) fputs(");", outfile);
 			fputs(row_delimiter, outfile);
 		}
 	}
 
 	/* free the memory used to bind */
-	for (i=0;i<table->num_cols;i++) {
-		g_free(bound_values[i]);
-	}
+    if (col_to_export < 65535)
+        g_free(bound_values[col_to_export]);
+    else if (columns_to_export) {
+        for (i = 0; i < cte_count; i++) {
+            g_free(bound_values[cte_array[i]]);
+        }
+    } else {
+        for (i = 0; i < table->num_cols; i++) {
+            g_free(bound_values[i]);
+        }
+    }
 	g_free(bound_values);
 	g_free(bound_lens);
 	mdb_free_tabledef(table);
@@ -352,7 +557,11 @@ main(int argc, char **argv)
 	g_free(namespace);
 	g_free(str_bin_mode);
 	g_free(table_name);
-	return 0;
+    g_free(columns_to_export);
+    g_free(cte_save_ptr);
+    g_free(token_state);
+    
+    return 0;
 }
 
 static void format_value(FILE *outfile, char *value, size_t length, int quote_text, int col_type, char *escape_char, char *quote_char, int bin_mode, int export_flags, char *backend_name)
