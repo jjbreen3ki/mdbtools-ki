@@ -16,8 +16,6 @@ m4/
 !m4/readline.m4
 config.log
 config.status
-configure
-/configure~
 Makefile.in
 Makefile
 doc/*.1
@@ -62,3 +60,4 @@ public/
 .sass-cache/
 *.css.map
 temp-man-pages/
+*.DS_Store
